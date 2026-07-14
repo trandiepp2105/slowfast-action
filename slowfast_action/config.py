@@ -11,6 +11,7 @@ class SlowFastShotFeatureConfig:
     end_index: Optional[int] = None
     device: str = "cuda"
     pretrained: bool = True
+    model_path: Optional[str] = None
     num_frames: int = 32
     sampling_rate: int = 2
     alpha: int = 4

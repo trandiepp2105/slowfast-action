@@ -9,6 +9,7 @@ config = SlowFastShotFeatureConfig(
     end_index=None,
     device="cuda",
     pretrained=True,
+    model_path=None,
     num_frames=32,
     sampling_rate=2,
     alpha=4,

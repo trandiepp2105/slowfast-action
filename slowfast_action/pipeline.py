@@ -33,8 +33,14 @@ class SlowFastShotFeatureExtractor:
         self.shot_loader = ShotLoader()
 
     def _load_model(self):
-        model = slowfast_r50(pretrained=self.config.pretrained)
+        use_pretrained = self.config.pretrained and self.config.model_path is None
+        model = slowfast_r50(pretrained=use_pretrained)
         model.blocks[-1].proj = nn.Identity()
+
+        if self.config.model_path is not None:
+            checkpoint = torch.load(self.config.model_path, map_location="cpu")
+            model.load_state_dict(checkpoint, strict=True)
+
         model = model.to(self.device)
         model.eval()
         return model
@@ -171,6 +177,7 @@ class SlowFastShotFeatureExtractor:
             "video_path": item["video_path"],
             "model_name": "slowfast_r50",
             "pretrained": bool(self.config.pretrained),
+            "model_path": self.config.model_path,
             "num_frames": int(self.config.num_frames),
             "sampling_rate": int(self.config.sampling_rate),
             "alpha": int(self.config.alpha),
