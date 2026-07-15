@@ -10,16 +10,16 @@ from torch import nn
 from torch.amp import autocast
 
 from .config import SlowFastShotFeatureConfig
+from .ffmpeg_reader import FFmpegVideoReader, ensure_ffmpeg_available
 from .io_utils import DatasetScanner, ShotLoader
 from .transforms import build_batched_video_transform, l2_normalize, temporal_resample_single_video
 
 try:
-    from pytorchvideo.data.encoded_video import EncodedVideo
     from pytorchvideo.models.hub import slowfast_r50
 except ImportError as error:
     raise ImportError(
         "Can cai pytorchvideo truoc khi chay module nay. "
-        "Vi du: pip install pytorchvideo torchvision av"
+        "Vi du: pip install pytorchvideo torchvision"
     ) from error
 
 
@@ -34,6 +34,7 @@ class SlowFastShotFeatureExtractor:
         self.model = self._load_model()
         self.scanner = DatasetScanner(config)
         self.shot_loader = ShotLoader()
+        ensure_ffmpeg_available()
 
     def _load_model(self):
         use_pretrained = self.config.pretrained and self.config.model_path is None
@@ -86,14 +87,11 @@ class SlowFastShotFeatureExtractor:
 
     def _decode_video_tensor(
         self,
-        video: EncodedVideo,
+        video_reader: FFmpegVideoReader,
         clip_start: float,
         clip_end: float,
     ) -> torch.Tensor:
-        clip = video.get_clip(start_sec=clip_start, end_sec=clip_end)
-        if clip is None or "video" not in clip or clip["video"] is None:
-            raise RuntimeError(f"Khong doc duoc clip trong khoang {clip_start:.3f}-{clip_end:.3f}")
-        return clip["video"]
+        return video_reader.get_clip(start_sec=clip_start, end_sec=clip_end)
 
     def _slice_time_range_from_video_tensor(
         self,
@@ -197,7 +195,7 @@ class SlowFastShotFeatureExtractor:
 
     def process_video_item(self, item: Dict[str, str]) -> Dict[str, Any]:
         shots = self.shot_loader.load(item["shots_json_path"])
-        video = EncodedVideo.from_path(item["video_path"])
+        video_reader = FFmpegVideoReader(item["video_path"])
         if len(shots) == 0:
             raise RuntimeError("Khong co shot nao trong file shot json")
 
@@ -217,7 +215,7 @@ class SlowFastShotFeatureExtractor:
         while chunk_start < video_end and record_cursor < len(all_subshot_records):
             chunk_core_end = min(chunk_start + chunk_core_duration, video_end)
             decode_end = min(chunk_core_end + chunk_margin, video_end)
-            chunk_tensor = self._decode_video_tensor(video, chunk_start, decode_end)
+            chunk_tensor = self._decode_video_tensor(video_reader, chunk_start, decode_end)
 
             chunk_records: List[Dict[str, Any]] = []
             while record_cursor < len(all_subshot_records):
