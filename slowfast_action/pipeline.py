@@ -6,10 +6,11 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 from torch import nn
+from torch.amp import autocast
 
 from .config import SlowFastShotFeatureConfig
 from .io_utils import DatasetScanner, ShotLoader
-from .transforms import build_video_transform, l2_normalize
+from .transforms import build_batched_video_transform, l2_normalize
 
 try:
     from pytorchvideo.data.encoded_video import EncodedVideo
@@ -27,7 +28,8 @@ class SlowFastShotFeatureExtractor:
         self.device = torch.device(
             config.device if config.device == "cuda" and torch.cuda.is_available() else "cpu"
         )
-        self.transform = build_video_transform(config)
+        self.use_autocast = self.device.type == "cuda"
+        self.transform = build_batched_video_transform(config).to(self.device)
         self.model = self._load_model()
         self.scanner = DatasetScanner(config)
         self.shot_loader = ShotLoader()
@@ -66,20 +68,6 @@ class SlowFastShotFeatureExtractor:
             ranges.append((sub_start, sub_end))
         return ranges
 
-    def _build_subshot_records(self, shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        subshot_records = []
-        for shot in shots:
-            for subshot_index, (clip_start, clip_end) in enumerate(self._build_subshot_ranges(shot)):
-                subshot_records.append(
-                    {
-                        "shot_id": int(shot["shot_id"]),
-                        "subshot_index": int(subshot_index),
-                        "clip_start": float(clip_start),
-                        "clip_end": float(clip_end),
-                    }
-                    )
-        return subshot_records
-
     def _decode_video_tensor(
         self,
         video: EncodedVideo,
@@ -91,61 +79,72 @@ class SlowFastShotFeatureExtractor:
             raise RuntimeError(f"Khong doc duoc clip trong khoang {clip_start:.3f}-{clip_end:.3f}")
         return clip["video"]
 
-    def _slice_subshot_video_tensor(
+    def _decode_full_video_tensor(
         self,
-        shot_video: torch.Tensor,
-        shot_start: float,
-        shot_end: float,
-        subshot_start: float,
-        subshot_end: float,
-    ) -> torch.Tensor:
-        total_frames = int(shot_video.shape[1])
-        if total_frames <= 0:
-            raise RuntimeError("Shot video tensor khong co frame de cat subshot")
+        video: EncodedVideo,
+        shots: List[Dict[str, Any]],
+    ) -> tuple[torch.Tensor, float, float]:
+        if len(shots) == 0:
+            raise RuntimeError("Khong co shot nao de decode video")
 
-        shot_duration = max(float(shot_end - shot_start), 1e-3)
-        rel_start = np.clip((subshot_start - shot_start) / shot_duration, 0.0, 1.0)
-        rel_end = np.clip((subshot_end - shot_start) / shot_duration, 0.0, 1.0)
+        video_start = float(min(shot["start_time_sec"] for shot in shots))
+        video_end = float(max(shot["end_time_sec"] for shot in shots))
+        if video_end <= video_start:
+            video_end = video_start + 1e-3
+        return self._decode_video_tensor(video, video_start, video_end), video_start, video_end
+
+    def _slice_time_range_from_video_tensor(
+        self,
+        video_tensor: torch.Tensor,
+        video_start: float,
+        video_end: float,
+        range_start: float,
+        range_end: float,
+    ) -> torch.Tensor:
+        total_frames = int(video_tensor.shape[1])
+        if total_frames <= 0:
+            raise RuntimeError("Video tensor khong co frame de cat segment")
+
+        video_duration = max(float(video_end - video_start), 1e-3)
+        rel_start = np.clip((range_start - video_start) / video_duration, 0.0, 1.0)
+        rel_end = np.clip((range_end - video_start) / video_duration, 0.0, 1.0)
 
         start_index = int(math.floor(rel_start * total_frames))
         end_index = int(math.ceil(rel_end * total_frames))
 
         start_index = min(max(start_index, 0), total_frames - 1)
         end_index = min(max(end_index, start_index + 1), total_frames)
-        return shot_video[:, start_index:end_index]
+        return video_tensor[:, start_index:end_index]
 
-    def _transform_video_tensor(self, video_tensor: torch.Tensor) -> List[torch.Tensor]:
-        clip = self.transform({"video": video_tensor})
-        return clip["video"]
+    def _transform_video_batch(self, video_batch: torch.Tensor) -> List[torch.Tensor]:
+        with torch.no_grad():
+            return self.transform(video_batch)
 
     def _extract_subshot_features_from_shot(
         self,
         shot: Dict[str, Any],
-        shot_video: torch.Tensor,
+        full_video_tensor: torch.Tensor,
+        video_start: float,
+        video_end: float,
     ) -> tuple[List[Dict[str, Any]], List[np.ndarray]]:
         subshot_ranges = self._build_subshot_ranges(shot)
         subshot_records: List[Dict[str, Any]] = []
         subshot_features: List[np.ndarray] = []
-        shot_start = float(shot["start_time_sec"])
-        shot_end = float(shot["end_time_sec"])
 
         for batch_start in range(0, len(subshot_ranges), self.config.batch_size):
             batch_ranges = subshot_ranges[batch_start:batch_start + self.config.batch_size]
-            slow_batch = []
-            fast_batch = []
+            batch_videos = []
 
             for local_index, (clip_start, clip_end) in enumerate(batch_ranges):
                 subshot_index = batch_start + local_index
-                subshot_video = self._slice_subshot_video_tensor(
-                    shot_video=shot_video,
-                    shot_start=shot_start,
-                    shot_end=shot_end,
-                    subshot_start=float(clip_start),
-                    subshot_end=float(clip_end),
+                subshot_video = self._slice_time_range_from_video_tensor(
+                    video_tensor=full_video_tensor,
+                    video_start=video_start,
+                    video_end=video_end,
+                    range_start=float(clip_start),
+                    range_end=float(clip_end),
                 )
-                slow_pathway, fast_pathway = self._transform_video_tensor(subshot_video)
-                slow_batch.append(slow_pathway)
-                fast_batch.append(fast_pathway)
+                batch_videos.append(subshot_video)
                 subshot_records.append(
                     {
                         "shot_id": int(shot["shot_id"]),
@@ -155,13 +154,27 @@ class SlowFastShotFeatureExtractor:
                     }
                 )
 
-            model_inputs = [
-                torch.stack(slow_batch, dim=0).to(self.device),
-                torch.stack(fast_batch, dim=0).to(self.device),
-            ]
+            max_frames = max(int(video_tensor.shape[1]) for video_tensor in batch_videos)
+            padded_batch = []
+            for video_tensor in batch_videos:
+                if int(video_tensor.shape[1]) == max_frames:
+                    padded_batch.append(video_tensor)
+                    continue
+
+                frame_indices = torch.linspace(
+                    0,
+                    video_tensor.shape[1] - 1,
+                    max_frames,
+                ).round().long()
+                padded_batch.append(torch.index_select(video_tensor, 1, frame_indices))
+
+            video_batch = torch.stack(padded_batch, dim=0).to(self.device, non_blocking=True)
+            slow_pathway, fast_pathway = self._transform_video_batch(video_batch)
+            model_inputs = [slow_pathway, fast_pathway]
 
             with torch.no_grad():
-                batch_features = self.model(model_inputs)
+                with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_autocast):
+                    batch_features = self.model(model_inputs)
 
             batch_features = batch_features.detach().cpu().numpy().astype(np.float32)
             subshot_features.extend(feature for feature in batch_features)
@@ -185,16 +198,14 @@ class SlowFastShotFeatureExtractor:
         video = EncodedVideo.from_path(item["video_path"])
         subshot_records: List[Dict[str, Any]] = []
         shot_features: List[Dict[str, Any]] = []
+        full_video_tensor, video_start, video_end = self._decode_full_video_tensor(video, shots)
 
         for shot in shots:
-            shot_video = self._decode_video_tensor(
-                video=video,
-                clip_start=float(shot["start_time_sec"]),
-                clip_end=float(shot["end_time_sec"]),
-            )
             shot_subshot_records, shot_subshot_features = self._extract_subshot_features_from_shot(
                 shot=shot,
-                shot_video=shot_video,
+                full_video_tensor=full_video_tensor,
+                video_start=video_start,
+                video_end=video_end,
             )
             pooled_feature = self._pool_subshot_features(shot_subshot_features)
             subshot_records.extend(shot_subshot_records)
