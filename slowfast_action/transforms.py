@@ -109,3 +109,7 @@ class BatchedVideoTransform(nn.Module):
 
 def build_batched_video_transform(config: SlowFastShotFeatureConfig) -> BatchedVideoTransform:
     return BatchedVideoTransform(config)
+
+
+def temporal_resample_single_video(video_tensor: torch.Tensor, num_frames: int) -> torch.Tensor:
+    return temporal_resample_with_repeat(video_tensor, num_frames)

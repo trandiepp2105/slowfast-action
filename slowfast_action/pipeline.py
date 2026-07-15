@@ -10,7 +10,7 @@ from torch.amp import autocast
 
 from .config import SlowFastShotFeatureConfig
 from .io_utils import DatasetScanner, ShotLoader
-from .transforms import build_batched_video_transform, l2_normalize
+from .transforms import build_batched_video_transform, l2_normalize, temporal_resample_single_video
 
 try:
     from pytorchvideo.data.encoded_video import EncodedVideo
@@ -142,23 +142,10 @@ class SlowFastShotFeatureExtractor:
                     range_start=float(record["clip_start"]),
                     range_end=float(record["clip_end"]),
                 )
+                subshot_video = temporal_resample_single_video(subshot_video, self.config.num_frames)
                 batch_videos.append(subshot_video)
 
-            max_frames = max(int(video_tensor.shape[1]) for video_tensor in batch_videos)
-            padded_batch = []
-            for video_tensor in batch_videos:
-                if int(video_tensor.shape[1]) == max_frames:
-                    padded_batch.append(video_tensor)
-                    continue
-
-                frame_indices = torch.linspace(
-                    0,
-                    video_tensor.shape[1] - 1,
-                    max_frames,
-                ).round().long()
-                padded_batch.append(torch.index_select(video_tensor, 1, frame_indices))
-
-            video_batch = torch.stack(padded_batch, dim=0).to(self.device, non_blocking=True)
+            video_batch = torch.stack(batch_videos, dim=0).to(self.device, non_blocking=True)
             slow_pathway, fast_pathway = self._transform_video_batch(video_batch)
             model_inputs = [slow_pathway, fast_pathway]
 
