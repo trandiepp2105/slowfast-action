@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--target_fps", type=float, default=30.0)
     parser.add_argument("--clip_duration_sec", type=float, default=(32 * 2) / 30.0)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--full_video_chunk_duration_sec", type=float, default=300.0)
     parser.add_argument("--save_dtype", type=str, default="float16", choices=["float16", "float32"])
     parser.add_argument("--overwrite", action="store_true")
 
@@ -59,6 +60,7 @@ def main():
         target_fps=args.target_fps,
         clip_duration_sec=args.clip_duration_sec,
         batch_size=args.batch_size,
+        full_video_chunk_duration_sec=args.full_video_chunk_duration_sec,
         save_dtype=args.save_dtype,
         overwrite=args.overwrite,
     )

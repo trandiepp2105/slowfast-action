@@ -91,7 +91,25 @@ class SlowFastShotFeatureExtractor:
         video_end = float(max(shot["end_time_sec"] for shot in shots))
         if video_end <= video_start:
             video_end = video_start + 1e-3
-        return self._decode_video_tensor(video, video_start, video_end), video_start, video_end
+
+        total_duration = video_end - video_start
+        chunk_duration = max(float(self.config.full_video_chunk_duration_sec), 1e-3)
+        if total_duration <= chunk_duration:
+            return self._decode_video_tensor(video, video_start, video_end), video_start, video_end
+
+        chunk_tensors: List[torch.Tensor] = []
+        chunk_start = video_start
+        while chunk_start < video_end:
+            chunk_end = min(chunk_start + chunk_duration, video_end)
+            chunk_tensor = self._decode_video_tensor(video, chunk_start, chunk_end)
+            chunk_tensors.append(chunk_tensor)
+            chunk_start = chunk_end
+
+        if len(chunk_tensors) == 0:
+            raise RuntimeError(f"Khong decode duoc bat ky chunk nao trong khoang {video_start:.3f}-{video_end:.3f}")
+
+        full_video_tensor = torch.cat(chunk_tensors, dim=1)
+        return full_video_tensor, video_start, video_end
 
     def _slice_time_range_from_video_tensor(
         self,

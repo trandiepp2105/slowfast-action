@@ -20,5 +20,6 @@ class SlowFastShotFeatureConfig:
     target_fps: float = 30.0
     clip_duration_sec: float = 32 * 2 / 30.0
     batch_size: int = 8
+    full_video_chunk_duration_sec: float = 120.0
     save_dtype: str = "float16"
     overwrite: bool = False
