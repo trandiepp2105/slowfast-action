@@ -68,6 +68,21 @@ class SlowFastShotFeatureExtractor:
             ranges.append((sub_start, sub_end))
         return ranges
 
+    def _build_all_subshot_records(self, shots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        subshot_records = []
+        for shot in shots:
+            for subshot_index, (clip_start, clip_end) in enumerate(self._build_subshot_ranges(shot)):
+                subshot_records.append(
+                    {
+                        "shot_id": int(shot["shot_id"]),
+                        "subshot_index": int(subshot_index),
+                        "clip_start": float(clip_start),
+                        "clip_end": float(clip_end),
+                    }
+                )
+        subshot_records.sort(key=lambda record: (record["clip_start"], record["clip_end"], record["shot_id"]))
+        return subshot_records
+
     def _decode_video_tensor(
         self,
         video: EncodedVideo,
@@ -78,38 +93,6 @@ class SlowFastShotFeatureExtractor:
         if clip is None or "video" not in clip or clip["video"] is None:
             raise RuntimeError(f"Khong doc duoc clip trong khoang {clip_start:.3f}-{clip_end:.3f}")
         return clip["video"]
-
-    def _decode_full_video_tensor(
-        self,
-        video: EncodedVideo,
-        shots: List[Dict[str, Any]],
-    ) -> tuple[torch.Tensor, float, float]:
-        if len(shots) == 0:
-            raise RuntimeError("Khong co shot nao de decode video")
-
-        video_start = float(min(shot["start_time_sec"] for shot in shots))
-        video_end = float(max(shot["end_time_sec"] for shot in shots))
-        if video_end <= video_start:
-            video_end = video_start + 1e-3
-
-        total_duration = video_end - video_start
-        chunk_duration = max(float(self.config.full_video_chunk_duration_sec), 1e-3)
-        if total_duration <= chunk_duration:
-            return self._decode_video_tensor(video, video_start, video_end), video_start, video_end
-
-        chunk_tensors: List[torch.Tensor] = []
-        chunk_start = video_start
-        while chunk_start < video_end:
-            chunk_end = min(chunk_start + chunk_duration, video_end)
-            chunk_tensor = self._decode_video_tensor(video, chunk_start, chunk_end)
-            chunk_tensors.append(chunk_tensor)
-            chunk_start = chunk_end
-
-        if len(chunk_tensors) == 0:
-            raise RuntimeError(f"Khong decode duoc bat ky chunk nao trong khoang {video_start:.3f}-{video_end:.3f}")
-
-        full_video_tensor = torch.cat(chunk_tensors, dim=1)
-        return full_video_tensor, video_start, video_end
 
     def _slice_time_range_from_video_tensor(
         self,
@@ -138,39 +121,28 @@ class SlowFastShotFeatureExtractor:
         with torch.no_grad():
             return self.transform(video_batch)
 
-    def _extract_subshot_features_from_shot(
+    def _extract_subshot_features_from_chunk(
         self,
-        shot: Dict[str, Any],
-        full_video_tensor: torch.Tensor,
-        video_start: float,
-        video_end: float,
-    ) -> tuple[List[Dict[str, Any]], List[np.ndarray]]:
-        subshot_ranges = self._build_subshot_ranges(shot)
-        subshot_records: List[Dict[str, Any]] = []
+        chunk_records: List[Dict[str, Any]],
+        chunk_tensor: torch.Tensor,
+        chunk_start: float,
+        chunk_end: float,
+    ) -> List[np.ndarray]:
         subshot_features: List[np.ndarray] = []
 
-        for batch_start in range(0, len(subshot_ranges), self.config.batch_size):
-            batch_ranges = subshot_ranges[batch_start:batch_start + self.config.batch_size]
+        for batch_start in range(0, len(chunk_records), self.config.batch_size):
+            batch_records = chunk_records[batch_start:batch_start + self.config.batch_size]
             batch_videos = []
 
-            for local_index, (clip_start, clip_end) in enumerate(batch_ranges):
-                subshot_index = batch_start + local_index
+            for record in batch_records:
                 subshot_video = self._slice_time_range_from_video_tensor(
-                    video_tensor=full_video_tensor,
-                    video_start=video_start,
-                    video_end=video_end,
-                    range_start=float(clip_start),
-                    range_end=float(clip_end),
+                    video_tensor=chunk_tensor,
+                    video_start=chunk_start,
+                    video_end=chunk_end,
+                    range_start=float(record["clip_start"]),
+                    range_end=float(record["clip_end"]),
                 )
                 batch_videos.append(subshot_video)
-                subshot_records.append(
-                    {
-                        "shot_id": int(shot["shot_id"]),
-                        "subshot_index": int(subshot_index),
-                        "clip_start": float(clip_start),
-                        "clip_end": float(clip_end),
-                    }
-                )
 
             max_frames = max(int(video_tensor.shape[1]) for video_tensor in batch_videos)
             padded_batch = []
@@ -197,7 +169,7 @@ class SlowFastShotFeatureExtractor:
             batch_features = batch_features.detach().cpu().numpy().astype(np.float32)
             subshot_features.extend(feature for feature in batch_features)
 
-        return subshot_records, subshot_features
+        return subshot_features
 
     def _pool_subshot_features(self, subshot_features: List[np.ndarray]) -> np.ndarray:
         stacked = np.stack(subshot_features, axis=0).astype(np.float32)
@@ -214,28 +186,71 @@ class SlowFastShotFeatureExtractor:
     def process_video_item(self, item: Dict[str, str]) -> Dict[str, Any]:
         shots = self.shot_loader.load(item["shots_json_path"])
         video = EncodedVideo.from_path(item["video_path"])
-        subshot_records: List[Dict[str, Any]] = []
-        shot_features: List[Dict[str, Any]] = []
-        full_video_tensor, video_start, video_end = self._decode_full_video_tensor(video, shots)
+        if len(shots) == 0:
+            raise RuntimeError("Khong co shot nao trong file shot json")
 
+        all_subshot_records = self._build_all_subshot_records(shots)
+        video_start = float(min(shot["start_time_sec"] for shot in shots))
+        video_end = float(max(shot["end_time_sec"] for shot in shots))
+        if video_end <= video_start:
+            video_end = video_start + 1e-3
+
+        chunk_core_duration = max(float(self.config.full_video_chunk_duration_sec), 1e-3)
+        chunk_margin = max(float(self.config.clip_duration_sec), 1e-3)
+
+        features_by_shot: Dict[int, List[np.ndarray]] = {int(shot["shot_id"]): [] for shot in shots}
+        record_cursor = 0
+
+        chunk_start = video_start
+        while chunk_start < video_end and record_cursor < len(all_subshot_records):
+            chunk_core_end = min(chunk_start + chunk_core_duration, video_end)
+            decode_end = min(chunk_core_end + chunk_margin, video_end)
+            chunk_tensor = self._decode_video_tensor(video, chunk_start, decode_end)
+
+            chunk_records: List[Dict[str, Any]] = []
+            while record_cursor < len(all_subshot_records):
+                record = all_subshot_records[record_cursor]
+                if float(record["clip_start"]) >= chunk_core_end:
+                    break
+                if float(record["clip_end"]) <= decode_end + 1e-6:
+                    chunk_records.append(record)
+                    record_cursor += 1
+                    continue
+                break
+
+            if len(chunk_records) > 0:
+                chunk_features = self._extract_subshot_features_from_chunk(
+                    chunk_records=chunk_records,
+                    chunk_tensor=chunk_tensor,
+                    chunk_start=chunk_start,
+                    chunk_end=decode_end,
+                )
+                for record, feature in zip(chunk_records, chunk_features):
+                    features_by_shot[int(record["shot_id"])].append(feature)
+
+            del chunk_tensor
+            chunk_start = chunk_core_end
+
+        if record_cursor != len(all_subshot_records):
+            raise RuntimeError("Van con subshot chua duoc xu ly sau khi quet het cac chunk")
+
+        shot_features: List[Dict[str, Any]] = []
         for shot in shots:
-            shot_subshot_records, shot_subshot_features = self._extract_subshot_features_from_shot(
-                shot=shot,
-                full_video_tensor=full_video_tensor,
-                video_start=video_start,
-                video_end=video_end,
-            )
+            shot_id = int(shot["shot_id"])
+            shot_subshot_features = features_by_shot[shot_id]
+            if len(shot_subshot_features) == 0:
+                raise RuntimeError(f"Shot {shot_id} khong co subshot feature nao duoc trich xuat")
+
             pooled_feature = self._pool_subshot_features(shot_subshot_features)
-            subshot_records.extend(shot_subshot_records)
             shot_features.append(
                 {
-                    "shot_id": int(shot["shot_id"]),
+                    "shot_id": shot_id,
                     "start_frame": int(shot["start_frame"]),
                     "end_frame": int(shot["end_frame"]),
                     "start_time_sec": float(shot["start_time_sec"]),
                     "end_time_sec": float(shot["end_time_sec"]),
                     "duration_sec": float(shot["duration_sec"]),
-                    "num_subshots": int(len(shot_subshot_records)),
+                    "num_subshots": int(len(shot_subshot_features)),
                     "pooling": "max",
                     "action_feature": self._cast_output_feature(pooled_feature),
                 }
@@ -255,10 +270,11 @@ class SlowFastShotFeatureExtractor:
             "target_fps": float(self.config.target_fps),
             "clip_duration_sec": float(self.config.clip_duration_sec),
             "batch_size": int(self.config.batch_size),
+            "full_video_chunk_duration_sec": float(self.config.full_video_chunk_duration_sec),
             "feature_dim": feature_dim,
             "feature_dtype": self.config.save_dtype,
             "num_shots": len(shot_features),
-            "num_subshots_total": int(len(subshot_records)),
+            "num_subshots_total": int(len(all_subshot_records)),
             "subshot_pooling": "max",
             "shots": shot_features,
         }
