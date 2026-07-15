@@ -72,7 +72,7 @@ class FFmpegVideoReader:
 
         frame_count = len(raw) // bytes_per_frame
         usable_bytes = frame_count * bytes_per_frame
-        frames = np.frombuffer(raw[:usable_bytes], dtype=np.uint8)
+        frames = np.frombuffer(raw[:usable_bytes], dtype=np.uint8).copy()
         frames = frames.reshape(frame_count, self.video_height, self.video_width, 3)
         video_tensor = torch.from_numpy(frames).permute(3, 0, 1, 2).contiguous()
         return video_tensor
