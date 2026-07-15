@@ -95,12 +95,19 @@ class BatchedVideoTransform(nn.Module):
         self.side_size = int(config.side_size)
         self.crop_size = int(config.crop_size)
         self.alpha = int(config.alpha)
-        self.register_buffer("mean", torch.tensor([0.45, 0.45, 0.45], dtype=torch.float32).view(1, 3, 1, 1, 1))
-        self.register_buffer("std", torch.tensor([0.225, 0.225, 0.225], dtype=torch.float32).view(1, 3, 1, 1, 1))
+        self.compute_dtype = torch.float16 if config.device == "cuda" else torch.float32
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.45, 0.45, 0.45], dtype=self.compute_dtype).view(1, 3, 1, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.225, 0.225, 0.225], dtype=self.compute_dtype).view(1, 3, 1, 1, 1),
+        )
 
     def forward(self, video_batch: torch.Tensor) -> List[torch.Tensor]:
         video_batch = temporal_resample_with_repeat_batch(video_batch, self.num_frames)
-        video_batch = video_batch.float().div_(255.0)
+        video_batch = video_batch.to(dtype=self.compute_dtype).div_(255.0)
         video_batch = (video_batch - self.mean) / self.std
         video_batch = short_side_scale_batch(video_batch, self.side_size)
         video_batch = uniform_crop_batch(video_batch, self.crop_size)

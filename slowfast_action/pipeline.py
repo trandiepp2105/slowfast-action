@@ -1,3 +1,4 @@
+import gc
 import math
 import pickle
 from pathlib import Path
@@ -121,6 +122,38 @@ class SlowFastShotFeatureExtractor:
         with torch.no_grad():
             return self.transform(video_batch)
 
+    def _empty_cuda_cache(self):
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _infer_video_batch(self, batch_videos: List[torch.Tensor]) -> List[np.ndarray]:
+        video_batch = None
+        slow_pathway = None
+        fast_pathway = None
+        batch_features = None
+
+        try:
+            video_batch = torch.stack(batch_videos, dim=0).to(self.device, non_blocking=True)
+            slow_pathway, fast_pathway = self._transform_video_batch(video_batch)
+            model_inputs = [slow_pathway, fast_pathway]
+
+            with torch.no_grad():
+                with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_autocast):
+                    batch_features = self.model(model_inputs)
+
+            return [feature for feature in batch_features.detach().cpu().numpy().astype(np.float32)]
+        except torch.OutOfMemoryError:
+            if len(batch_videos) <= 1:
+                raise
+            self._empty_cuda_cache()
+            mid = len(batch_videos) // 2
+            left_features = self._infer_video_batch(batch_videos[:mid])
+            right_features = self._infer_video_batch(batch_videos[mid:])
+            return left_features + right_features
+        finally:
+            del video_batch, slow_pathway, fast_pathway, batch_features
+            self._empty_cuda_cache()
+
     def _extract_subshot_features_from_chunk(
         self,
         chunk_records: List[Dict[str, Any]],
@@ -145,16 +178,8 @@ class SlowFastShotFeatureExtractor:
                 subshot_video = temporal_resample_single_video(subshot_video, self.config.num_frames)
                 batch_videos.append(subshot_video)
 
-            video_batch = torch.stack(batch_videos, dim=0).to(self.device, non_blocking=True)
-            slow_pathway, fast_pathway = self._transform_video_batch(video_batch)
-            model_inputs = [slow_pathway, fast_pathway]
-
-            with torch.no_grad():
-                with autocast(device_type=self.device.type, dtype=torch.float16, enabled=self.use_autocast):
-                    batch_features = self.model(model_inputs)
-
-            batch_features = batch_features.detach().cpu().numpy().astype(np.float32)
-            subshot_features.extend(feature for feature in batch_features)
+            batch_features = self._infer_video_batch(batch_videos)
+            subshot_features.extend(batch_features)
 
         return subshot_features
 
@@ -216,6 +241,8 @@ class SlowFastShotFeatureExtractor:
                     features_by_shot[int(record["shot_id"])].append(feature)
 
             del chunk_tensor
+            gc.collect()
+            self._empty_cuda_cache()
             chunk_start = chunk_core_end
 
         if record_cursor != len(all_subshot_records):
@@ -317,5 +344,8 @@ class SlowFastShotFeatureExtractor:
                         "error": repr(error),
                     }
                 )
+            finally:
+                gc.collect()
+                self._empty_cuda_cache()
 
         return summary
