@@ -9,6 +9,7 @@ class SlowFastShotFeatureConfig:
     output_dir: str
     start_index: int = 0
     end_index: Optional[int] = None
+    video_ids: Optional[list[str]] = None
     device: str = "cuda"
     pretrained: bool = True
     model_path: Optional[str] = None

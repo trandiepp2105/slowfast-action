@@ -31,6 +31,14 @@ class DatasetScanner:
                 }
             )
 
+        if self.config.video_ids:
+            wanted = {str(video_id) for video_id in self.config.video_ids}
+            return [
+                item
+                for item in items
+                if item["video_name"] in wanted or Path(item["video_path"]).name in wanted
+            ]
+
         start = max(0, int(self.config.start_index))
         end = self.config.end_index
 

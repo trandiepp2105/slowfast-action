@@ -14,6 +14,7 @@ def parse_args():
 
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--end_index", type=int, default=None)
+    parser.add_argument("--video_ids", nargs="+", default=None)
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--pretrained", action="store_true")
@@ -49,6 +50,7 @@ def main():
         output_dir=args.output_dir,
         start_index=args.start_index,
         end_index=args.end_index,
+        video_ids=args.video_ids,
         device=args.device,
         pretrained=pretrained,
         model_path=args.model_path,
